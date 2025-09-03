@@ -1,69 +1,37 @@
-import os, sys, logging, httpx, asyncio
-from dotenv import load_dotenv
-from AI_Module import ai
+import asyncio, logging
 import discord
+from discord.ext import commands
+from config import settings
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-load_dotenv()
+# set up logging
+logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-API_KEY = os.getenv("POLYGON_API_KEY")
-if not TOKEN:
-    print("No DISCORD_TOKEN found. Check .env")
-    raise SystemExit(1)
-if not API_KEY:
-    print("No POLYGON_API_KEY found. Check .env")
-    raise SystemExit(1)
-
+# setting up bot intents so that it can have accesss to all events
 intents = discord.Intents.default()
-intents.message_content = True  # <-- REQUIRED for reading messages
-client = discord.Client(intents=intents)
+intents.message_content = True
 
-async def fetch_prev_close(symbol: str) -> str:
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol.upper()}/prev"
-    params = {"adjusted": "true", "apiKey": API_KEY}
-    async with httpx.AsyncClient(timeout=15) as http:
-        r = await http.get(url, params=params)
-        if r.status_code == 401:
-            return "Polygon auth failed (401). Check API key."
-        if r.status_code == 403:
-            return "Polygon key not authorized for this endpoint (403)."
-        if r.status_code == 429:
-            return "Rate limited by Polygon (429). Try again later."
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("results"):
-            return f"No data for {symbol.upper()}."
-        res = data["results"][0]
-        c = res["c"]; h = res["h"]; l = res["l"]; v = res["v"]
-        return f"{symbol.upper()} prev close: {c:.2f} (H:{h:.2f} L:{l:.2f}) Vol:{int(v):,}"
+# create a bot instance
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-@client.event
+# list of extensions (cogs) to load
+EXTENSIONS = [
+    "modules.ai.cog",
+    "modules.backtesting.cog",
+    "modules.intel.cog",
+]
+
+# event handler for when the bot is ready
+@bot.event
 async def on_ready():
-    print(f"✅ Logged in as {client.user} (id: {client.user.id})")
-    await client.change_presence(status=discord.Status.online,
-                                 activity=discord.Game("Booting…"))
+    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
 
-# fetching price
-@client.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if message.content.startswith("!price"):
-        parts = message.content.split()
-        if len(parts) != 2:
-            await message.channel.send("Usage: `!price AAPL`")
-            return
-        symbol = parts[1]
-        await message.channel.send("Fetching…")
-        try:
-            reply = await fetch_prev_close(symbol)
-        except httpx.HTTPError as e:
-            reply = f"HTTP error: {e}"
-        except Exception as e:
-            reply = f"Unexpected error: {e}"
-        await message.channel.send(reply)
+# runs the bot
+async def main():
+    for ext in EXTENSIONS:
+        await bot.load_extension(ext)
+    await bot.start(settings.DISCORD_TOKEN)
 
 
-
-client.run(TOKEN)
+# entry point for running the bot
+if __name__ == "__main__":
+    asyncio.run(main())

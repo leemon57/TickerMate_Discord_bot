@@ -1,5 +1,6 @@
 import os, sys, logging, httpx, asyncio
 from dotenv import load_dotenv
+from AI_Module import ai
 import discord
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)

@@ -1,49 +1,68 @@
+# intel/cog.py
+from __future__ import annotations
+
+import asyncio
+import discord
 from discord.ext import commands
+from discord import Embed
+
 from .loader import PolygonClient
 
 
-# Define a COg for all "intel" commands
 class IntelCog(commands.Cog):
-    def __init__(self, bot):
-        # keep a reference to the main bot
+    """Commands for market intel: prices & headlines (via Polygon)."""
+
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # create one PolygonClient instance to reuse across commands
-        self.pg = PolygonClient()
+        self.pg = PolygonClient()  # reuse one async HTTP client
 
-    async def cog_unload(self):
-        await self.pg.aclose()
+    # discord.py doesn't await async cog_unload; schedule the close instead
+    def cog_unload(self):
+        asyncio.create_task(self.pg.aclose())
 
-    # Define a command: !price SYMBOL
     @commands.command(name="price")
-    async def price(self, ctx, symbol: str):
-        # Send a quick response so the user knows the bot is working
-        await ctx.send("Fetching…")
+    async def price(self, ctx: commands.Context, symbol: str):
+        """Show previous close (and H/L/Vol) for a symbol. Usage: !price AAPL"""
+        clean = symbol.upper().strip()
+        await ctx.send(f"Fetching {clean}…")
         try:
-            # Ask Polygon for the previous close data
-            d = await self.pg.prev_close(symbol)
-            # Send the nicely formatted result back to Discord
-            await ctx.send(f"{symbol.upper()} prev close: {d['c']:.2f} (H:{d['h']:.2f} L:{d['l']:.2f}) Vol:{int(d['v']):,}")
+            d = await self.pg.prev_close(clean)
+            msg = (
+                f"**{clean}** prev close: **{d['c']:.2f}**  "
+                f"(H:{d['h']:.2f} • L:{d['l']:.2f})  Vol:{int(d['v']):,}"
+            )
+            await ctx.send(msg)
         except Exception as e:
-            # If something goes wrong (bad ticker, API down, etc.), show the error
-            await ctx.send(f"Error: {e}")
+            await ctx.send(f"Error fetching price for {clean}: {e}")
 
-    # Define another command: !sma SYMBOL [WINDOW]
-    @commands.command(name="sma")
-    async def sma(self, ctx, symbol: str, window: int = 20):
-        await ctx.send(f"Calculating SMA({window})…")
+    @commands.command(name="news")
+    async def news(self, ctx: commands.Context, symbol: str, limit: int = 5):
+        """Show latest headlines (with URLs). Usage: !news AAPL 5"""
+        clean = symbol.upper().strip()
+        limit = max(1, min(int(limit), 10))  # keep it sane
+        await ctx.send(f"Fetching {clean} news…")
         try:
-            # Ask Polygon for SMA values
-            j = await self.pg.sma(symbol, window=window)
-            vals = j.get("results", {}).get("values", [])
-            if not vals:
-                await ctx.send("No SMA data.")
+            items = await self.pg.news(clean, limit=limit)
+            if not items:
+                await ctx.send("No recent news found.")
                 return
-            # Send the most recent SMA value
-            await ctx.send(f"{symbol.upper()} SMA({window}) latest: {vals[-1]['value']:.2f}")
-        except Exception as e:
-            # Handle and show errors cleanly
-            await ctx.send(f"Error: {e}")
 
-# Entry point required by discord.py for loading this cog as an extension
-async def setup(bot):
+            emb = Embed(title=f"{clean} — Latest Headlines")
+            for n in items[:limit]:
+                when = n.published_at.strftime("%Y-%m-%d %H:%M UTC")
+                # raw URL (<...>) is reliably clickable in Discord
+                emb.add_field(
+                    name=n.title[:256],  # field name limit
+                    value=f"{n.publisher} • {when}\n<{n.url}>",
+                    inline=False,
+                )
+
+            await ctx.send(embed=emb)
+        except Exception as e:
+            await ctx.send(f"Error fetching news for {clean}: {e}")
+
+
+async def setup(bot: commands.Bot):
+    """Entry point for discord.py extension loading."""
     await bot.add_cog(IntelCog(bot))
+    

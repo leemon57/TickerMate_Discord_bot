@@ -54,24 +54,30 @@ Notes
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol
 from datetime import datetime, timedelta, timezone
 
 import httpx
 
 from config import settings
-from .contract import Quote, Bar, NewsItem, Dividend, Split, Earnings, IntelBundle
+from .contract import (
+    Quote, Bar, NewsItem, Dividend, Split, Earnings, IntelBundle,
+    # ---- options (make sure these exist in contract.py) ----
+    OptionContract, OptionQuote, OptionSnapshot, OptionChain,
+)
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Config
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 _BASE = "https://api.polygon.io"
 _API_KEY = settings.POLYGON_API_KEY
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
@@ -85,6 +91,7 @@ def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
 
 def _epoch_ms_to_utc(ms: Optional[int]) -> Optional[datetime]:
     if ms is None:
@@ -102,15 +109,15 @@ async def _request_with_retry(
 ) -> httpx.Response:
     tries = 0
     params = dict(params or {})
-    if "apiKey" not in params:
-        params["apiKey"] = _API_KEY
+    params.setdefault("apiKey", _API_KEY)
 
     while True:
         r = await http.request(method, url, params=params)
+
         if r.status_code in (401, 403):
             raise RuntimeError(f"Polygon auth/permission error {r.status_code}: {r.text}")
 
-        if r.status_code == 429:
+        if r.status_code == 429:  # rate limited
             tries += 1
             if tries > max_retries:
                 raise RuntimeError("Polygon rate limited (429) after retries.")
@@ -118,7 +125,7 @@ async def _request_with_retry(
             await asyncio.sleep(retry_after)
             continue
 
-        if r.status_code >= 500:
+        if r.status_code >= 500:  # server error
             tries += 1
             if tries > max_retries:
                 r.raise_for_status()
@@ -129,19 +136,43 @@ async def _request_with_retry(
         return r
 
 
-# -----------------------------------------------------------------------------
+def _default_range(timespan: str, lookback: int) -> tuple[str, str]:
+    end_dt = datetime.now(timezone.utc).date()
+    if timespan == "day":
+        start_dt = end_dt - timedelta(days=lookback)
+    elif timespan == "week":
+        start_dt = end_dt - timedelta(weeks=lookback)
+    elif timespan == "month":
+        start_dt = end_dt - timedelta(days=30 * lookback)
+    else:
+        start_dt = end_dt - timedelta(days=lookback)
+    return (start_dt.isoformat(), end_dt.isoformat())
+
+
+# =============================================================================
 # Ports (interfaces)
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 class EventsPort(Protocol):
     async def dividends(self, symbol: str, *, limit: int = 50) -> List[Dividend]: ...
     async def splits(self, symbol: str, *, limit: int = 50) -> List[Split]: ...
     async def earnings(self, symbol: str, *, limit: int = 12) -> List[Earnings]: ...
 
 
-# -----------------------------------------------------------------------------
-# Polygon events adapter (optional, for dividends/splits via Polygon)
-# -----------------------------------------------------------------------------
+class OptionsPort(Protocol):
+    async def expirations(self, symbol: str) -> List[datetime]: ...
+    async def chain(self, symbol: str, expiration: datetime) -> OptionChain: ...
+
+
+# =============================================================================
+# Events providers
+# =============================================================================
+
 class PolygonEventsProvider(EventsPort):
+    """
+    Uses Polygon reference endpoints for dividends/splits.
+    Earnings left empty (you can add another provider if needed).
+    """
     def __init__(self, http: httpx.AsyncClient, *, base: str = "https://api.polygon.io"):
         self.http = http
         self.base = base
@@ -154,8 +185,6 @@ class PolygonEventsProvider(EventsPort):
         while True:
             params = {"ticker": symbol.upper(), "limit": min(limit, 1000)}
             if cursor:
-                # Polygon supports next_page via "cursor" in some SDKs, or next_url/next in JSON.
-                # To stay robust, just add "cursor" if we have one.
                 params["cursor"] = cursor
             r = await _request_with_retry(self.http, "GET", url, params=params)
             j = r.json()
@@ -191,17 +220,11 @@ class PolygonEventsProvider(EventsPort):
             j = r.json()
 
             for s in j.get("results", []):
-                ratio = None
                 if s.get("split_from") and s.get("split_to"):
                     ratio = f"{s.get('split_from')}/{s.get('split_to')}"
                 else:
                     ratio = s.get("ratio") or "1/1"
-                out.append(
-                    Split(
-                        ratio=ratio,
-                        execution_date=_parse_iso_utc(s.get("execution_date")),
-                    )
-                )
+                out.append(Split(ratio=ratio, execution_date=_parse_iso_utc(s.get("execution_date"))))
 
             cursor = j.get("next_url") or j.get("next_url_cursor") or j.get("next")
             if not cursor or len(out) >= limit:
@@ -210,15 +233,13 @@ class PolygonEventsProvider(EventsPort):
         return out[:limit]
 
     async def earnings(self, symbol: str, *, limit: int = 12) -> List[Earnings]:
-        # Polygon’s earnings endpoints/coverage vary; keep empty so you can combine with another provider.
-        return []
+        return []  # keep open for an alternative provider later
 
 
-# -----------------------------------------------------------------------------
-# YFinance events adapter (preferred here; no API key)
-# -----------------------------------------------------------------------------
-# This provider calls yfinance’s synchronous API from threads so your bot stays async.
 class YFinanceEventsProvider(EventsPort):
+    """
+    yfinance-based events (no key). Uses background threads so we remain async.
+    """
     def __init__(self):
         import yfinance as yf
         self.yf = yf
@@ -230,7 +251,6 @@ class YFinanceEventsProvider(EventsPort):
             if s is None or getattr(s, "empty", True):
                 return []
             out: List[Dividend] = []
-            # last N rows only
             for dt, cash in list(s.items())[-limit:]:
                 ts = dt.to_pydatetime()
                 if ts.tzinfo is None:
@@ -239,7 +259,7 @@ class YFinanceEventsProvider(EventsPort):
                     Dividend(
                         cash_amount=float(cash) if cash is not None else 0.0,
                         declaration_date=None,
-                        ex_dividend_date=ts,   # yfinance exposes payout date-like series; treat as best-effort ex/pay marker
+                        ex_dividend_date=ts,   # best-effort mapping
                         payment_date=None,
                         record_date=None,
                         frequency=None,
@@ -256,10 +276,8 @@ class YFinanceEventsProvider(EventsPort):
                 r = float(x)
             except Exception:
                 return str(x)
-            # r >= 1 -> "r/1" (e.g., 4.0 -> "4/1")
             if r >= 1:
                 return f"{int(r)}/1" if r.is_integer() else f"{r}/1"
-            # r < 1 -> "1/k" if invertible to clean int, else keep decimal
             inv = 1.0 / r
             return f"1/{int(inv)}" if inv.is_integer() else f"1/{inv}"
 
@@ -299,41 +317,138 @@ class YFinanceEventsProvider(EventsPort):
                 if rpt is not None and rpt.tzinfo is None:
                     rpt = rpt.replace(tzinfo=timezone.utc)
 
-                # column names vary by yfinance version — be defensive
                 eps_act = row.get("Reported EPS") or row.get("EPS Actual") or row.get("ReportedEPS")
                 eps_est = row.get("EPS Estimate") or row.get("EPS Est.") or row.get("EPSEstimate")
                 eps = float(eps_act) if eps_act is not None else None
                 consensus = float(eps_est) if eps_est is not None else None
                 surprise_abs = (eps - consensus) if (eps is not None and consensus is not None) else None
 
-                out.append(
-                    Earnings(
-                        fiscal_period=None,
-                        eps=eps,
-                        consensus_eps=consensus,
-                        report_date=rpt,
-                        surprise=surprise_abs,
-                        revenue=None,
-                    )
-                )
+                out.append(Earnings(
+                    fiscal_period=None,
+                    eps=eps,
+                    consensus_eps=consensus,
+                    report_date=rpt,
+                    surprise=surprise_abs,
+                    revenue=None,
+                ))
             return out
         return await asyncio.to_thread(_fetch)
 
 
-# -----------------------------------------------------------------------------
-# Polygon market data client (quotes/bars/news + pluggable events)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Options provider (yfinance for now; Polygon later)
+# =============================================================================
+
+class YFinanceOptionsProvider(OptionsPort):
+    """
+    Options via yfinance. Converts DataFrames -> dataclasses in a thread.
+    """
+    def __init__(self):
+        import yfinance as yf
+        self.yf = yf
+
+    async def expirations(self, symbol: str) -> List[datetime]:
+        def _fetch() -> List[datetime]:
+            tkr = self.yf.Ticker(symbol)
+            exps = getattr(tkr, "options", []) or []
+            out: List[datetime] = []
+            for s in exps:
+                try:
+                    dt = datetime.fromisoformat(s).replace(tzinfo=None)
+                    out.append(dt)
+                except Exception:
+                    continue
+            out.sort()
+            return out
+        return await asyncio.to_thread(_fetch)
+
+    async def chain(self, symbol: str, expiration: datetime) -> OptionChain:
+        def _fetch() -> OptionChain:
+            tkr = self.yf.Ticker(symbol)
+            date_str = expiration.date().isoformat()
+            ch = tkr.option_chain(date_str)  # NamedTuple(calls=DataFrame, puts=DataFrame)
+
+            def _f(x):
+                try:
+                    return float(x) if x is not None else None
+                except Exception:
+                    return None
+
+            def _i(x):
+                try:
+                    return int(x) if x is not None else None
+                except Exception:
+                    return None
+
+            def rows_to_snapshots(df, right_letter: str) -> List[OptionSnapshot]:
+                if df is None or getattr(df, "empty", True):
+                    return []
+                records = df.to_dict("records")
+                out: List[OptionSnapshot] = []
+                for r in records:
+                    try:
+                        cs = str(r.get("contractSymbol") or "")
+                        strike = float(r.get("strike"))
+                        itm = bool(r.get("inTheMoney"))
+                        last  = _f(r.get("lastPrice"))
+                        bid   = _f(r.get("bid"))
+                        ask   = _f(r.get("ask"))
+                        vol   = _i(r.get("volume"))
+                        oi    = _i(r.get("openInterest"))
+                        iv    = _f(r.get("impliedVolatility"))
+
+                        contract = OptionContract(
+                            contract_symbol=cs,
+                            underlying= symbol.upper(),
+                            right= right_letter,
+                            strike= strike,
+                            expiration= expiration.replace(tzinfo=None),
+                            in_the_money= itm,
+                        )
+                        quote = OptionQuote(
+                            last=last, bid=bid, ask=ask,
+                            volume=vol, open_interest=oi, implied_vol=iv
+                        )
+                        out.append(OptionSnapshot(contract=contract, quote=quote))
+                    except Exception:
+                        continue
+                out.sort(key=lambda s: s.contract.strike)
+                return out
+
+            calls = rows_to_snapshots(ch.calls, "C")
+            puts  = rows_to_snapshots(ch.puts,  "P")
+            return OptionChain(underlying=symbol.upper(), expiration=expiration, calls=calls, puts=puts)
+
+        return await asyncio.to_thread(_fetch)
+
+
+# =============================================================================
+# Polygon market data client (quotes/bars/news + pluggable events & options)
+# =============================================================================
+
 class PolygonClient:
-    """Async client for Polygon quotes/bars/news; events via pluggable EventsPort."""
-    def __init__(self, timeout: float = 15.0, events_provider: Optional[EventsPort] = None):
+    """
+    Async client for Polygon quotes/bars/news; events via EventsPort; options via OptionsPort.
+    Defaults: events -> YFinanceEventsProvider; options -> YFinanceOptionsProvider.
+    You can swap in Polygon-based providers later without touching cogs.
+    """
+
+    def __init__(
+        self,
+        timeout: float = 15.0,
+        events_provider: Optional[EventsPort] = None,
+        options_provider: Optional[OptionsPort] = None,
+    ):
         if not _API_KEY:
             raise RuntimeError("POLYGON_API_KEY missing in environment/.env")
         self.http = httpx.AsyncClient(timeout=timeout)
-        # Default to YFinance for events per your request
         self.events: EventsPort = events_provider or YFinanceEventsProvider()
+        self.options: OptionsPort = options_provider or YFinanceOptionsProvider()
 
     async def aclose(self):
         await self.http.aclose()
+
+    # ---------- core polygon ----------
 
     async def prev_close(self, symbol: str, adjusted: bool = True) -> Dict[str, Any]:
         url = f"{_BASE}/v2/aggs/ticker/{symbol.upper()}/prev"
@@ -395,6 +510,8 @@ class PolygonClient:
             )
         return items
 
+    # ---------- high-level bundle ----------
+
     async def bundle(
         self,
         symbol: str,
@@ -430,9 +547,12 @@ class PolygonClient:
         bars = [Bar(t=b["t"], o=b["o"], h=b["h"], l=b["l"], c=b["c"], v=b["v"]) for b in bars_raw]
 
         # news
-        latest_news = await self.news(symbol, limit=news_limit)
+        if news_limit and news_limit > 0:
+            latest_news = await self.news(symbol, limit=news_limit)
+        else:
+            latest_news = []
 
-        # events (pluggable)
+        # events (via EventsPort)
         dividends, splits, earnings = await asyncio.gather(
             self.events.dividends(symbol, limit=events_limit),
             self.events.splits(symbol, limit=events_limit),
@@ -449,39 +569,48 @@ class PolygonClient:
             earnings=earnings,
         )
 
+    # ---------- options convenience ----------
 
-# -----------------------------------------------------------------------------
-# Range helper
-# -----------------------------------------------------------------------------
-def _default_range(timespan: str, lookback: int) -> tuple[str, str]:
-    end_dt = datetime.now(timezone.utc).date()
-    if timespan == "day":
-        start_dt = end_dt - timedelta(days=lookback)
-    elif timespan == "week":
-        start_dt = end_dt - timedelta(weeks=lookback)
-    elif timespan == "month":
-        start_dt = end_dt - timedelta(days=30 * lookback)
-    else:
-        start_dt = end_dt - timedelta(days=lookback)
-    return (start_dt.isoformat(), end_dt.isoformat())
+    async def option_expirations(self, symbol: str) -> List[datetime]:
+        return await self.options.expirations(symbol)
+
+    async def option_chain(self, symbol: str, expiration: datetime) -> OptionChain:
+        return await self.options.chain(symbol, expiration)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Smoke test
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 async def _smoke():
-    # By default, uses YFinanceEventsProvider; to force Polygon events, pass:
-    #   cli = PolygonClient(events_provider=PolygonEventsProvider(httpx.AsyncClient()))
     cli = PolygonClient()
     try:
         b = await cli.bundle("AAPL", bars_timespan="week", bars_lookback=12, events_limit=10)
         print("Bundle for", b.symbol)
-        print("Prev close:", b.quote.prevClose)
+        print("Prev close:", b.quote.prevClose if b.quote else None)
         print("Bars:", len(b.bars))
         print("News:", len(b.news))
         print("Dividends:", len(b.dividends))
         print("Splits:", len(b.splits))
         print("Earnings:", len(b.earnings))
+
+        # Options: list expirations and fetch the nearest chain
+        exps = await cli.option_expirations("AAPL")
+        if exps:
+            print("Nearest expiration:", exps[0].date())
+            chain = await cli.option_chain("AAPL", exps[0])
+            print(f"Calls: {len(chain.calls)} | Puts: {len(chain.puts)}")
+            # Show an ATM-ish snapshot
+            px = b.quote.prevClose if b.quote else 0.0
+            def closest(lst, x): return min(lst, key=lambda s: abs(s.contract.strike - x)) if lst else None
+            atm_call = closest(chain.calls, px)
+            atm_put  = closest(chain.puts,  px)
+            if atm_call:
+                print("ATM Call", atm_call.contract.strike, "bid/ask", atm_call.quote.bid, atm_call.quote.ask)
+            if atm_put:
+                print("ATM Put ", atm_put.contract.strike, "bid/ask", atm_put.quote.bid, atm_put.quote.ask)
+        else:
+            print("No option expirations found.")
     finally:
         await cli.aclose()
 

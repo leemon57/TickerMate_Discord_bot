@@ -1,0 +1,220 @@
+Market Bot Integration Guide — Stocks & Crypto (Loaders + Commands)
+This guide explains how to use the stock loader (PolygonClient) and the crypto loader (CryptoClient), how to request different kinds of data, how to consume the returned IntelBundle, and how to use the provided Discord commands.
+________________________________________
+0) Prerequisites & Setup
+Environment variables (in .env):
+DISCORD_TOKEN=...                 # Discord bot token
+POLYGON_API_KEY=...               # for stock quotes/bars/news
+CRYPTOPANIC_API_KEY=...           # for crypto news (optional; news will be empty if missing)
+Project layout (simplified):
+Discord_bot/
+├── bot.py
+├── cogs/
+│   └── market_cog.py             # the cog that wires both loaders
+└── intel/
+    ├── contract.py               # dataclasses for all shared models
+    ├── stock_loader.py           # PolygonClient + yfinance events/options
+    └── crypto_loader.py          # CryptoClient (Coinbase + Binance + CryptoPanic)
+Load the cog in bot.py:
+async with bot:
+    await bot.load_extension("cogs.market_cog")
+    await bot.start(os.environ["DISCORD_TOKEN"])
+________________________________________
+1) Data Contracts (what you get back)
+Core dataclasses (in intel/contract.py):
+•	Quote { symbol, prevClose, high, low, volume, as_of }
+•	Bar   { t(ms), o, h, l, c, v }
+•	NewsItem { publisher, title, url, published_at, sentiment?, importance?, kind?, currencies[], score? }
+•	Dividend { cash_amount, declaration_date?, ex_dividend_date?, payment_date?, record_date?, frequency? }
+•	Split { ratio, execution_date? }
+•	Earnings { fiscal_period?, eps?, consensus_eps?, report_date?, surprise?, revenue? }
+•	OpenInterest { symbol, amount, ts?, currency? } (crypto)
+•	Funding { symbol, rate, next_funding_time? } (crypto)
+•	IntelBundle { symbol, quote?, bars[], news[], dividends[], splits[], earnings[], open_interest?, funding? }
+Stocks: open_interest and funding are None.
+Crypto: dividends/splits/earnings are empty lists by design.
+________________________________________
+2) Stock Loader (PolygonClient)
+2.1 Constructing the client
+from intel.stock_loader import PolygonClient
+stock = PolygonClient()
+•	Events provider: defaults to YFinanceEventsProvider (dividends/splits/earnings).
+•	Options provider: defaults to YFinanceOptionsProvider (option chains via yfinance).
+•	You can swap providers later via constructor args without changing cogs.
+2.2 Requesting data
+Bundle (quotes + bars + news + events)
+b = await stock.bundle(
+    "AAPL",
+    bars_multiplier=1,
+    bars_timespan="day",      # "day" | "week" | "month" (Polygon aggs)
+    bars_start=None,           # if None, auto-computed from lookback
+    bars_end=None,
+    bars_lookback=60,          # how many units of timespan
+    news_limit=6,              # set to 0 to skip news
+    events_limit=20            # how many dividends/splits/earnings to return
+)
+Tip: If you don’t need news in a particular call, pass news_limit=0 — the loader will skip the API call to avoid limit=0 errors.
+Aggregates only (raw bars)
+bars_raw = await stock.aggregates("AAPL", 1, "day", start="2024-01-01", end="2024-12-31")
+Previous close (Polygon “prev”)
+q_prev = await stock.prev_close("AAPL")   # raw dict from Polygon
+News only (Polygon reference news)
+news = await stock.news("AAPL", limit=5)
+2.3 Options (yfinance-backed by default)
+List expirations:
+exps = await stock.option_expirations("AAPL")  # List[datetime]
+Fetch chain for a given expiration:
+from datetime import datetime
+exp = exps[0] or datetime.fromisoformat("2025-09-19")
+chain = await stock.option_chain("AAPL", exp)
+# chain.calls / chain.puts -> List[OptionSnapshot]
+Each OptionSnapshot contains contract (symbol/right/strike/expiration/in_the_money) and quote (last/bid/ask/volume/open_interest/implied_vol).
+________________________________________
+3) Crypto Loader (CryptoClient)
+3.1 Constructing the client
+from intel.crypto_loader import CryptoClient
+from config import settings
+
+crypto = CryptoClient(cryptopanic_api_key=settings.CRYPTOPANIC_API_KEY,
+                      granularity=3600,   # 1h candles
+                      lookback=300)       # up to exchange limit
+•	Spot data: Coinbase (OHLCV and 24h stats → Quote + Bar[]).
+•	Derivatives: Binance Futures (open interest + funding).
+•	News: CryptoPanic (requires CRYPTOPANIC_API_KEY; returns empty list if missing).
+3.2 Requesting data
+Bundle (quote + candles + derivatives + news)
+b = await crypto.bundle(
+    "BTC-USD",         # also accepts "ETH-USD", or already-perp-like "BTCUSDT"
+    news_limit=5
+)
+•	OI/funding are fetched using a mapped symbol (e.g., BTC-USD → BTCUSDT).
+•	Quote.prevClose uses Coinbase 24h open as a sessionless proxy.
+Bars only (spot candles)
+bars = await crypto.spot.bars("BTC-USD", granularity=3600, lookback=200)
+Funding or OI individually
+perp = "BTCUSDT"
+oi = await crypto.derivs.open_interest(perp)
+funding = await crypto.derivs.funding(perp)
+Crypto news only
+items = await crypto.newsprov.news("BTC", limit=5)
+________________________________________
+4) Consuming the IntelBundle (stocks & crypto)
+4.1 Common fields
+b.symbol               # "AAPL" or "BTC-USD"
+q = b.quote            # Quote or None
+if q:
+    q.prevClose, q.high, q.low, q.volume, q.as_of
+
+bars = b.bars          # List[Bar]
+for bar in bars:
+    bar.t, bar.o, bar.h, bar.l, bar.c, bar.v
+
+news = b.news          # List[NewsItem]
+for n in news:
+    n.publisher, n.title, n.url, n.published_at
+    n.sentiment, n.importance, n.kind, n.currencies, n.score
+4.2 Equity-only fields
+for d in b.dividends:
+    d.cash_amount, d.ex_dividend_date, d.declaration_date, d.payment_date, d.frequency
+
+for s in b.splits:
+    s.ratio, s.execution_date
+
+for e in b.earnings:
+    e.report_date, e.eps, e.consensus_eps, e.surprise, e.fiscal_period
+4.3 Crypto-only fields
+if b.open_interest:
+    b.open_interest.amount      # contracts / base units (e.g., ~BTC for BTCUSDT)
+    b.open_interest.currency    # display hint (e.g., "USDT")
+
+if b.funding:
+    b.funding.rate              # 0.0001 == 0.01%
+    b.funding.next_funding_time
+Notional OI example: notional_usd = (b.open_interest.amount or 0) * (b.quote.prevClose or 0)
+________________________________________
+5) Using loaders in other parts of the bot
+5.1 Charts package (turn bars into DataFrame/PNG/CSV)
+Your charts/ package can stay pandas-only, while intel stays pandas-free. Example helper contract between them:
+# charts/adapters.py
+import pandas as pd
+from intel.contract import Bar
+
+def bars_to_df(bars: list[Bar]) -> pd.DataFrame:
+    df = pd.DataFrame([{
+        "t": b.t, "o": b.o, "h": b.h, "l": b.l, "c": b.c, "v": b.v
+    } for b in bars])
+    df["dt"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+    df.set_index("dt", inplace=True)
+    return df[["o","h","l","c","v"]]
+Then your ChartCog can call:
+b = await stock.bundle("AAPL", bars_timespan="day", bars_lookback=180, news_limit=0)
+df = bars_to_df(b.bars)
+# render candlestick / export CSV / compute indicators later
+5.2 Indicators package (SMA/EMA/RSI/MACD)
+Operate purely on the DataFrame returned by bars_to_df so both stocks and crypto share the same path:
+# indicators/core.py
+import pandas as pd
+
+def sma(df: pd.DataFrame, n: int) -> pd.Series:
+    return df["c"].rolling(n).mean()
+5.3 Parallel fetching (speed-up)
+You can run multiple bundles in parallel with asyncio.gather:
+symbols = ["AAPL", "MSFT", "NVDA"]
+results = await asyncio.gather(*(stock.bundle(s, news_limit=0) for s in symbols))
+5.4 Provider swapping (config-driven)
+Later, if you add PolygonOptionsProvider or a different events provider, wire it at construction time — your cogs don’t change:
+use_polygon_opts = False  # from settings
+client = PolygonClient(options_provider=YFinanceOptionsProvider())
+________________________________________
+6) Discord Commands (from cogs/market_cog.py)
+6.1 !price <SYMBOL> — stock or crypto autodetected
+•	Stocks: shows prev close, high/low, volume.
+•	Crypto: shows 24h proxy (Coinbase stats), high/low, volume, plus OI/funding if available.
+Examples:
+!price AAPL
+!price BTC-USD
+6.2 !news <SYMBOL> [limit] — latest headlines
+•	Stocks: Polygon news.
+•	Crypto: CryptoPanic news (requires API key). Includes badges: importance ★, score, currencies.
+Examples:
+!news AAPL 5
+!news ETH-USD
+6.3 !funding <CRYPTO_SYMBOL> — crypto derivatives snapshot
+•	Displays funding rate (as %) and open interest (contracts + implied notional).
+Example:
+!funding BTC-USD
+6.4 !expirations <STOCK> — list option expirations
+•	Returns the nearest 10 expirations (more exist; you can paginate as needed).
+Example:
+!expirations AAPL
+6.5 !chain <STOCK> [YYYY-MM-DD] — option chain quick view
+•	Shows counts and ATM bid/ask for calls/puts at the chosen (or nearest) expiration.
+Examples:
+!chain AAPL
+!chain AAPL 2025-09-19
+________________________________________
+7) Error Handling & Gotchas
+•	Polygon news limit: Do not call Polygon news with limit=0. The stock loader guards this by skipping the call when news_limit <= 0.
+•	yfinance Series truthiness: Never do series or []; check is None or .empty first (the provider already does this).
+•	Crypto OI units: Binance reports contracts/base units (e.g., BTC). Use spot price to compute USD notional.
+•	Missing API key: If CRYPTOPANIC_API_KEY is not set, crypto news returns an empty list.
+•	Shutdown: Always call .aclose() on clients when unloading the cog.
+________________________________________
+8) Testing & Smoke Checks
+Stocks:
+b = await stock.bundle("AAPL", bars_timespan="week", bars_lookback=12, news_limit=3)
+print(b.symbol, len(b.bars), len(b.news), len(b.dividends), len(b.splits), len(b.earnings))
+Crypto:
+b = await crypto.bundle("BTC-USD", news_limit=3)
+print(b.symbol, len(b.bars), b.funding.rate if b.funding else None, len(b.news))
+Options:
+exps = await stock.option_expirations("AAPL")
+chain = await stock.option_chain("AAPL", exps[0])
+print(len(chain.calls), len(chain.puts))
+________________________________________
+9) Extending Providers (advanced)
+•	Events (stocks): Add PolygonEventsProvider or another vendor behind EventsPort and pass via PolygonClient(events_provider=...).
+•	Options: Implement PolygonOptionsProvider behind OptionsPort for greeks/IV via Polygon snapshots.
+•	Crypto news: Swap CryptoPanicNews for a different aggregator behind a small CryptoNewsPort interface.
+Keep your cogs and charts untouched — that’s the power of the shared contracts.
+________________________________________

@@ -16,6 +16,9 @@ async def main():
     async with bot:
         # because cog.py lives in the intel package:
         await bot.load_extension("intel.cog")
+        await bot.load_extension("charts.cog")
+        await bot.load_extension("indicators.indicator_cog")
+        await bot.load_extension("ai.ai_cog")
         await bot.start(os.environ["DISCORD_TOKEN"])
 
 if __name__ == "__main__":

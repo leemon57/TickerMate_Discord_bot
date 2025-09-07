@@ -46,19 +46,6 @@ class AICog(commands.Cog):
             color=discord.Color.dark_teal()
         )
 
-        for name in ("trend","levels","derivs","events"):
-            val = result.get(name)
-            if val:
-                embed.add_field(name=name.capitalize(), value=json.dumps(val, separators=(',',':')), inline=False)
-
-        def _bullets(key):
-            arr = result.get(key, [])
-            return "• " + "\n• ".join(arr[:4]) if arr else None
-
-        for title,key in (("Bull Signals","signals_bull"), ("Bear Signals","signals_bear"), ("Risks","risk_notes"), ("News","news")):
-            v = _bullets(key)
-            if v: embed.add_field(name=title, value=v, inline=False)
-
         embed.set_footer(text="Informational only — not investment advice")
         await ctx.send(embed=embed)
 

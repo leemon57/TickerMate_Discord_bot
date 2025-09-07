@@ -414,14 +414,7 @@ if __name__ == "__main__":
 
 ---
 
-## 🤝 Contributing
-
-* Issues and PRs welcome! Please include logs (with redacted secrets) and exact command examples.
-* Keep embeds concise; prefer single-message replies.
-
----
-
 ## 🙏 Acknowledgements
 
-* Thanks to Polygon.io, yfinance, Coinbase, Binance, and CryptoPanic for their public APIs.
+* Thanks to Polygon.io, Coinbase, Binance, and CryptoPanic for their public APIs.
 * Built with `discord.py` and OpenAI’s Chat Completions API.

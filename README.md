@@ -27,9 +27,7 @@
 ├─ ai/
 │  ├─ analyst.py            # Build compact fact pack: price, indicators, S/R, events, derivs, news
 │  └─ client.py             # Calls OpenAI; structured output (rating/conf/summary/…)
-├─ cogs/
-│  ├─ ai_cog.py             # !ai SYMBOL [horizon] [risk]
-│  └─ chart_cog.py          # !chart / !csv commands
+│  └─ ai_cog.py
 ├─ intel/
 │  ├─ stock_loader.py       # Polygon + yfinance-based loader for stocks & options
 │  ├─ crypto_loader.py      # Coinbase/Binance/CryptoPanic loader for crypto
@@ -39,12 +37,12 @@
 │  ├─ adapters.py           # bars_to_df, resampling
 │  ├─ exporters.py          # df_to_csv_bytes
 │  └─ renderers.py          # render_line_close, render_candles
+│  └─ cog.py                # MarketCog: !price, !news, !funding, !expirations, !chain
 ├─ indicators/
 │  ├─ core.py               # SMA, EMA, RSI, MACD, BB, ATR, OBV, etc.
 │  └─ indicator_cog.py      # (optional) commands like !sma, !rsi, !macd
-├─ main.py                  # bot entrypoint (example below)
+├─ bot.py                  # bot entrypoint (example below)
 ├─ requirements.txt         # pinned deps (see below)
-├─ .env.example             # environment variables template
 └─ README.md                # this file
 ```
 

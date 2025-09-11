@@ -22,6 +22,11 @@ SYSTEM_MSG = (
     "Return structured fields for the analysis. "
     "Do NOT default to 3; pick the most likely direction based on evidence. "
     "If evidence is balanced, use 3 with LOW confidence and include a brief uncertainty note in risk_notes. "
+    "You MUST include: an action among {buy,hold,sell}, levels (support/resistance), and both entry_plan and exit_plan. "
+    "Entry guidance should be concrete (e.g., breakout above nearest resistance or pullback near support). "
+    "Exit guidance should include numeric stops (e.g., just below support, ~0.5*ATR) and targets (e.g., next resistance). "
+    "Default rubric (unless contradicted by facts): rating>=4 & confidence>=0.65 => buy; "
+    "rating<=2 & confidence>=0.65 => sell; otherwise hold. "
     "Output must strictly match the schema when provided."
 )
 
@@ -43,6 +48,9 @@ ANALYSIS_SCHEMA: Dict[str, Any] = {
         "rating": {"type": "integer", "minimum": 1, "maximum": 5},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "summary": {"type": "string"},
+
+        "action": {"type": "string", "enum": ["buy", "hold", "sell"]},  # NEW
+
         "trend": {
             "type": "object",
             "properties": {
@@ -54,14 +62,39 @@ ANALYSIS_SCHEMA: Dict[str, Any] = {
             "required": ["dir"],
             "additionalProperties": True
         },
-        "levels": {
+
+        "levels": {  # tighten so model must give arrays
             "type": "object",
             "properties": {
                 "support": {"type": "array", "items": {"type": "number"}},
                 "resistance": {"type": "array", "items": {"type": "number"}}
             },
+            "required": ["support", "resistance"],
             "additionalProperties": True
         },
+
+        "entry_plan": {  # NEW
+            "type": "object",
+            "properties": {
+                "method": {"type": "string"},                          # 'breakout' | 'pullback' | etc.
+                "entries": {"type": "array", "items": {"type": "number"}, "maxItems": 2},
+                "notes": {"type": "string"}
+            },
+            "required": ["method", "entries"],
+            "additionalProperties": True
+        },
+
+        "exit_plan": {   # NEW
+            "type": "object",
+            "properties": {
+                "stops": {"type": "array", "items": {"type": "number"}, "maxItems": 2},
+                "targets": {"type": "array", "items": {"type": "number"}, "maxItems": 3},
+                "notes": {"type": "string"}
+            },
+            "required": ["stops", "targets"],
+            "additionalProperties": True
+        },
+
         "signals_bull": {"type": "array", "items": {"type": "string"}},
         "signals_bear": {"type": "array", "items": {"type": "string"}},
         "derivs": {
@@ -84,7 +117,10 @@ ANALYSIS_SCHEMA: Dict[str, Any] = {
         "news": {"type": "array", "items": {"type": "string"}},
         "risk_notes": {"type": "array", "items": {"type": "string"}}
     },
-    "required": ["symbol", "rating", "confidence", "summary"],
+    "required": [
+        "symbol", "rating", "confidence", "summary",
+        "action", "levels", "entry_plan", "exit_plan"  # NEW required fields
+    ],
     "additionalProperties": True
 }
 
